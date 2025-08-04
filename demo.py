@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 # -----------------------------------------------------
 # 1.  Toy data generator
 # -----------------------------------------------------
-target_func = torch.cos
+target_func = torch.sin
 def generate_data(batch_size=512):
     x = torch.empty(batch_size, 1).uniform_(-np.pi, np.pi)
     y = target_func(x)
@@ -21,9 +21,10 @@ class DFA_MLP(nn.Module):
         super().__init__()
         self.W1 = nn.Parameter(torch.randn(hidden_dim, input_dim+1))
         self.W2 = nn.Parameter(torch.randn(output_dim, hidden_dim+1))
-
-        # Fixed random feedback matrices (NOT trainable)
-        self.register_buffer('B', torch.randn(hidden_dim, output_dim)*0.1)
+        # orthogonal matrix of shape (hidden_dim, output_dim)
+        B = torch.empty(hidden_dim, output_dim)
+        nn.init.orthogonal_(B)          # rows are orthonormal when hidden ≥ output
+        self.register_buffer('B', B)
 
     # ---------- forward ----------
     def forward(self, x):
@@ -37,9 +38,7 @@ class DFA_MLP(nn.Module):
     def local_update(self, x, h1, y_pred, y_target, lr):
         e_out = y_pred - y_target
         e1 = e_out @ self.B.t()
-
-        x1 = torch.cat([x, torch.ones_like(x)], dim=1)          # (B, 2)
-
+        x1 = torch.cat([x, torch.ones(x.size(0), 1, device=x.device)], dim=1)
         self.W1.data -= lr * (e1.t() @ x1) / x.size(0)
         self.W2.data -= lr * (e_out.t() @ h1) / x.size(0)
 
@@ -50,8 +49,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print('Using device:', device)
 
 model = DFA_MLP(input_dim=1, hidden_dim=64, output_dim=1).to(device)
-lr = 0.025
-max_epochs = 5_000
+lr = 0.1
+max_epochs = 5000
 
 for epoch in range(max_epochs + 1):
     x_batch, y_batch = generate_data(128)
