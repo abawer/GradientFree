@@ -42,66 +42,48 @@ class SPSA_LowRankMLP(nn.Module):
         return y_pred
 
 # -----------------------------------------------------
-# 3. SPSA update for Low-Rank factors
+# 3. SPSA update per layer (individual perturbations)
 # -----------------------------------------------------
 def spsa_update(model, x, y_target, lr, epsilon=1e-4):
     criterion = nn.MSELoss()
     with torch.no_grad():
-        # Helper to compute loss
         def compute_loss():
             y_pred = model(x)
             return criterion(y_pred, y_target).item()
 
-        # SPSA perturbation for a parameter tensor
-        def spsa_step(param):
-            delta = torch.randint(0, 2, param.shape, device=param.device, dtype=torch.float32) * 2 - 1  # ±1
+        layers = ['U1', 'V1', 'U2', 'V2']
+        grads = {}
+
+        for layer_name in layers:
+            param = getattr(model, layer_name)
+            delta = torch.randint(0, 2, param.shape, device=param.device, dtype=torch.float32) * 2 - 1
+
             param_plus = param + epsilon * delta
             param_minus = param - epsilon * delta
-            return delta, param_plus, param_minus
 
-        # Perturb all U and V
-        delta_U1, U1_plus, U1_minus = spsa_step(model.U1)
-        delta_V1, V1_plus, V1_minus = spsa_step(model.V1)
-        delta_U2, U2_plus, U2_minus = spsa_step(model.U2)
-        delta_V2, V2_plus, V2_minus = spsa_step(model.V2)
+            # Save original param
+            param_orig = param.clone()
 
-        # Compute losses for perturbed parameters
-        # Perturb all simultaneously (one SPSA step)
-        model.U1.copy_(U1_plus)
-        model.V1.copy_(V1_plus)
-        model.U2.copy_(U2_plus)
-        model.V2.copy_(V2_plus)
-        loss_plus = compute_loss()
+            # Perturb +epsilon
+            param.copy_(param_plus)
+            loss_plus = compute_loss()
 
-        model.U1.copy_(U1_minus)
-        model.V1.copy_(V1_minus)
-        model.U2.copy_(U2_minus)
-        model.V2.copy_(V2_minus)
-        loss_minus = compute_loss()
+            # Perturb -epsilon
+            param.copy_(param_minus)
+            loss_minus = compute_loss()
 
-        # Restore original params (midpoint)
-        model.U1.copy_((U1_plus + U1_minus) / 2)
-        model.V1.copy_((V1_plus + V1_minus) / 2)
-        model.U2.copy_((U2_plus + U2_minus) / 2)
-        model.V2.copy_((V2_plus + V2_minus) / 2)
+            # Restore original param
+            param.copy_(param_orig)
 
-        # Estimate gradients and update
-        grad_U1 = (loss_plus - loss_minus) / (2 * epsilon) * delta_U1
-        grad_V1 = (loss_plus - loss_minus) / (2 * epsilon) * delta_V1
-        grad_U2 = (loss_plus - loss_minus) / (2 * epsilon) * delta_U2
-        grad_V2 = (loss_plus - loss_minus) / (2 * epsilon) * delta_V2
+            # Estimate gradient
+            grad = (loss_plus - loss_minus) / (2 * epsilon) * delta
+            grad = torch.clamp(grad, -1.0, 1.0)
+            grads[layer_name] = grad
 
-        # Gradient clipping for stability
-        grad_U1 = torch.clamp(grad_U1, -1.0, 1.0)
-        grad_V1 = torch.clamp(grad_V1, -1.0, 1.0)
-        grad_U2 = torch.clamp(grad_U2, -1.0, 1.0)
-        grad_V2 = torch.clamp(grad_V2, -1.0, 1.0)
-
-        # Update factors
-        model.U1 -= lr * grad_U1
-        model.V1 -= lr * grad_V1
-        model.U2 -= lr * grad_U2
-        model.V2 -= lr * grad_V2
+        # Update parameters
+        for layer_name in layers:
+            param = getattr(model, layer_name)
+            param -= lr * grads[layer_name]
 
 # -----------------------------------------------------
 # 4. Training loop
@@ -135,7 +117,6 @@ with torch.no_grad():
     ys_pred = model(xs).cpu()
     ys_true = target_func(xs.cpu())
 
-import matplotlib.pyplot as plt
 plt.figure(figsize=(6, 3))
 plt.plot(xs.cpu(), ys_pred, label='SPSA Low-Rank Learned')
 plt.plot(xs.cpu(), ys_true, '--', label=f'True {target_func.__name__}(x)')
