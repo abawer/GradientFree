@@ -22,7 +22,10 @@ class DFA_MLP(nn.Module):
         super().__init__()
         self.W1 = nn.Parameter(torch.randn(hidden_dim, input_dim + 1))
         self.W2 = nn.Parameter(torch.randn(output_dim, hidden_dim + 1))
-        self.register_buffer('B', (torch.rand(hidden_dim, output_dim)*2-1)/math.sqrt(hidden_dim))
+        self.register_buffer(
+          'B',
+          (2 * torch.rand(hidden_dim, output_dim) - 1) / math.sqrt(output_dim+hidden_dim)
+        )
 
     def forward(self, x):
         x1 = torch.cat([x, torch.ones(x.size(0), 1, device=x.device)], dim=1)
