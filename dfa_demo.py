@@ -1,43 +1,41 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import math
 import matplotlib.pyplot as plt
 
 # -----------------------------------------------------
 # 1.  Toy data generator
 # -----------------------------------------------------
 target_func = torch.sin
+
 def generate_data(batch_size=512):
     x = torch.empty(batch_size, 1).uniform_(-np.pi, np.pi)
     y = target_func(x)
     return x, y
 
 # -----------------------------------------------------
-# 2.  Network definition  (bias via concat-1)
+# 2.  Network definition  (B is FIXED)
 # -----------------------------------------------------
 class DFA_MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super().__init__()
-        self.W1 = nn.Parameter(torch.randn(hidden_dim, input_dim+1))
-        self.W2 = nn.Parameter(torch.randn(output_dim, hidden_dim+1))
-        # orthogonal matrix of shape (hidden_dim, output_dim)
-        B = torch.empty(hidden_dim, output_dim)
-        nn.init.orthogonal_(B)          # rows are orthonormal when hidden ≥ output
-        self.register_buffer('B', B)
+        self.W1 = nn.Parameter(torch.randn(hidden_dim, input_dim + 1))
+        self.W2 = nn.Parameter(torch.randn(output_dim, hidden_dim + 1))
+        self.register_buffer('B', torch.randn(hidden_dim, output_dim) / math.sqrt(output_dim+hidden_dim))
 
-    # ---------- forward ----------
     def forward(self, x):
         x1 = torch.cat([x, torch.ones(x.size(0), 1, device=x.device)], dim=1)
-        h  = torch.sigmoid(x1 @ self.W1.t())
+        h = torch.sigmoid(x1 @ self.W1.t())
         h1 = torch.cat([h, torch.ones(h.size(0), 1, device=h.device)], dim=1)
         y_pred = h1 @ self.W2.t()
         return y_pred, h1
 
-    # ---------- local update ----------
     def local_update(self, x, h1, y_pred, y_target, lr):
         e_out = y_pred - y_target
         e1 = e_out @ self.B.t()
         x1 = torch.cat([x, torch.ones(x.size(0), 1, device=x.device)], dim=1)
+
         self.W1.data -= lr * (e1.t() @ x1) / x.size(0)
         self.W2.data -= lr * (e_out.t() @ h1) / x.size(0)
 
@@ -75,5 +73,5 @@ plt.figure(figsize=(6, 3))
 plt.plot(xs.cpu(), ys_pred.cpu(), label='DFA-learned')
 plt.plot(xs.cpu(), ys_true, '--', label=f'True {target_func.__name__}(x)')
 plt.legend()
-plt.title(f'DFA after {max_epochs} epochs')
+plt.title(f'DFA after {max_epochs} epochs (fixed B)')
 plt.show()
