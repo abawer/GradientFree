@@ -13,33 +13,31 @@ def generate_data(batch_size=512):
     return x, y
 
 # -----------------------------------------------------
-# 2. Network with frozen noisy weights and Low-Rank correction matrices
+# 2. Network with frozen noisy weights and Low-Rank additive correction matrices
 # -----------------------------------------------------
 class SPSA_LowRankMLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, low_rank=16):
         super().__init__()
         # Fixed noisy weights (frozen)
-        self.W1_noisy = nn.Parameter(torch.randn(hidden_dim, input_dim+1), requires_grad=False)
-        self.W2_noisy = nn.Parameter(torch.randn(output_dim, hidden_dim+1), requires_grad=False)
+        self.W1_noisy = nn.Parameter(torch.randn(hidden_dim, input_dim + 1), requires_grad=False)
+        self.W2_noisy = nn.Parameter(torch.randn(output_dim, hidden_dim + 1), requires_grad=False)
 
-        # Low-Rank factors U and V
-        self.U1 = nn.Parameter(torch.eye(hidden_dim, low_rank))
-        self.V1 = nn.Parameter(torch.eye(hidden_dim, low_rank))
-        self.U2 = nn.Parameter(torch.eye(output_dim, low_rank))
-        self.V2 = nn.Parameter(torch.eye(output_dim, low_rank))
+        # Low-Rank factors U and V for additive corrections
+        self.U1 = nn.Parameter(torch.randn(hidden_dim, low_rank) * 0.01)
+        self.V1 = nn.Parameter(torch.randn(low_rank, input_dim + 1) * 0.01)
+        self.U2 = nn.Parameter(torch.randn(output_dim, low_rank) * 0.01)
+        self.V2 = nn.Parameter(torch.randn(low_rank, hidden_dim + 1) * 0.01)
 
     def forward(self, x):
-        x1 = torch.cat([x, torch.ones(x.size(0), 1, device=x.device)], dim=1)
+        x1 = torch.cat([x, torch.ones(x.size(0), 1, device=x.device)], dim=1)  # add bias term
 
-        # Low-Rank Correction Matrices
-        C1 = self.U1 @ self.V1.T  # (hidden_dim x hidden_dim)
-        W1_corr = C1 @ self.W1_noisy
+        # Low-Rank Correction Matrices (additive)
+        W1_corr = self.W1_noisy + (self.U1 @ self.V1)  # (hidden_dim x (input_dim+1))
         h = torch.sigmoid(x1 @ W1_corr.t())
 
-        h1 = torch.cat([h, torch.ones(h.size(0), 1, device=h.device)], dim=1)
+        h1 = torch.cat([h, torch.ones(h.size(0), 1, device=h.device)], dim=1)  # add bias term
 
-        C2 = self.U2 @ self.V2.T  # (output_dim x output_dim)
-        W2_corr = C2 @ self.W2_noisy
+        W2_corr = self.W2_noisy + (self.U2 @ self.V2)  # (output_dim x (hidden_dim+1))
         y_pred = h1 @ W2_corr.t()
         return y_pred
 
@@ -54,7 +52,7 @@ def spsa_update(model, x, y_target, lr, epsilon=1e-4):
             y_pred = model(x)
             return criterion(y_pred, y_target).item()
 
-        # SPSA perturbation for all factors simultaneously
+        # SPSA perturbation for a parameter tensor
         def spsa_step(param):
             delta = torch.randint(0, 2, param.shape, device=param.device, dtype=torch.float32) * 2 - 1  # ±1
             param_plus = param + epsilon * delta
@@ -81,7 +79,7 @@ def spsa_update(model, x, y_target, lr, epsilon=1e-4):
         model.V2.copy_(V2_minus)
         loss_minus = compute_loss()
 
-        # Restore original params
+        # Restore original params (midpoint)
         model.U1.copy_((U1_plus + U1_minus) / 2)
         model.V1.copy_((V1_plus + V1_minus) / 2)
         model.U2.copy_((U2_plus + U2_minus) / 2)
@@ -137,9 +135,10 @@ with torch.no_grad():
     ys_pred = model(xs).cpu()
     ys_true = target_func(xs.cpu())
 
+import matplotlib.pyplot as plt
 plt.figure(figsize=(6, 3))
 plt.plot(xs.cpu(), ys_pred, label='SPSA Low-Rank Learned')
 plt.plot(xs.cpu(), ys_true, '--', label=f'True {target_func.__name__}(x)')
 plt.legend()
-plt.title(f'SPSA Low-Rank Correction after {max_epochs} epochs')
+plt.title(f'SPSA Low-Rank Additive Correction after {max_epochs} epochs')
 plt.show()
