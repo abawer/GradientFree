@@ -2,16 +2,18 @@ import torch, math, random, matplotlib.pyplot as plt
 torch.manual_seed(0)
 
 device     = 'cpu'
-STEPS      = 50_000
+STEPS      = 5_000
 EVAL_EVERY = 200
 MIN_HIDDEN = 0
 MAX_HIDDEN = 3
-MUT_SIGMA  = 0.01
-WIDTH      = 16
+MUT_SIGMA  = 0.005
+WIDTH      = 32
 
 # ---------- data ----------
-x = torch.linspace(0, 1, 128).unsqueeze(1)
-y = torch.sin(2 * math.pi * x)
+def samples(size=300):
+  x = torch.linspace(0, 1, size).unsqueeze(1)
+  y = torch.sin(2 * math.pi * x)
+  return x, y
 
 # ---------- network ----------
 # each layer is (W, b) with shapes:
@@ -32,6 +34,7 @@ def forward(x):
     return h @ W + b
 
 def loss():
+    x,y = samples(size=300)
     return ((forward(x) - y) ** 2).mean()
 
 def rand_wb():
@@ -45,8 +48,10 @@ def mutate_wb(wb, sigma):
             b + torch.randn_like(b) * sigma)
 
 # ---------- helpers ----------
-def choose_action():
+def choose_action(only_mutate=False):
     actions = ['mutate']
+    if only_mutate:
+      return actions[0]
     if len(hidden) < MAX_HIDDEN:
         actions.append('add')
     if len(hidden) > MIN_HIDDEN:
@@ -64,7 +69,7 @@ for step in range(1, STEPS + 1):
     old_tail   = (tail[0].clone(), tail[1].clone())
     old_hidden = [(W.clone(), b.clone()) for (W, b) in hidden]
 
-    action = choose_action()
+    action = choose_action(step > 1000)
 
     if action == 'add':
         pos = random.randint(0, len(hidden))
@@ -83,6 +88,7 @@ for step in range(1, STEPS + 1):
 
     new_mse = loss()
     if new_mse < current_mse:
+        #print(f'{action} improved MSE from {current_mse} to {new_mse}')
         current_mse = new_mse
     else:
         head, tail, hidden = old_head, old_tail, old_hidden
@@ -94,8 +100,8 @@ print("\nFinal hidden layers:", len(hidden), "Final MSE:", current_mse.item())
 
 # ---------- plot ----------
 with torch.no_grad():
-    x_plot = torch.linspace(0, 1, 300).unsqueeze(1)
+    x_plot, y = samples(500)
     y_hat = forward(x_plot).squeeze()
-plt.plot(torch.linspace(0, 1, 300), torch.sin(2 * math.pi * torch.linspace(0, 1, 300)), label='target')
-plt.plot(torch.linspace(0, 1, 300), y_hat, label='tapeworm')
+plt.plot(x_plot, y, label='target')
+plt.plot(x_plot, y_hat, label='tapeworm')
 plt.legend(); plt.show()
