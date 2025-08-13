@@ -2,9 +2,10 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+import random
 
 torch.manual_seed(42)
-device = 'cpu'  # you said CPU only
+device = 'cpu'
 
 # ------------------------------------------------------------------
 # Data
@@ -21,15 +22,20 @@ X_train, Y_train = generate_data()
 # ------------------------------------------------------------------
 class LayerGridMLP:
     WIDTH = 32
-    K = 10
-    half = torch.logspace(-2, 0, K // 2, base=10)
+    K = 3000  # large K
+    half = torch.logspace(-3, 0, K // 2, base=10)
     grid = torch.cat([-half.flip(0), torch.zeros(1), half]) * 2.0
     grid = grid.to(device)
 
     def __init__(self):
-        self.h1 = np.random.randint(0, self.K, (self.WIDTH, 2), dtype=np.uint8)
-        self.h2 = np.random.randint(0, self.K, (self.WIDTH, self.WIDTH + 1), dtype=np.uint8)
-        self.h3 = np.random.randint(0, self.K, (1, self.WIDTH + 1), dtype=np.uint8)
+        self.h1 = np.random.randint(0, self.K, (self.WIDTH, 2), dtype=np.uint32)
+        self.h2 = np.random.randint(0, self.K, (self.WIDTH, self.WIDTH + 1), dtype=np.uint32)
+        self.h3 = np.random.randint(0, self.K, (1, self.WIDTH + 1), dtype=np.uint32)
+
+        # Cached activations
+        self.a1_cache = None
+        self.a2_cache = None
+        self.cache_valid = {'h1': False, 'h2': False, 'h3': False}
 
     def _weight(self, h):
         idx = torch.from_numpy(h.astype(np.int64)).to(device)
@@ -49,7 +55,6 @@ class LayerGridMLP:
         b3 = self._weight(self.h3[:, -1])
         return F.linear(x, W3, b3)
 
-    # Forward from precomputed a1
     def forward_from_a1(self, a1):
         W2 = self._weight(self.h2[:, :-1]).view(self.WIDTH, self.WIDTH)
         b2 = self._weight(self.h2[:, -1])
@@ -59,43 +64,20 @@ class LayerGridMLP:
         b3 = self._weight(self.h3[:, -1])
         return F.linear(a2, W3, b3)
 
-    # Forward from precomputed a2
     def forward_from_a2(self, a2):
         W3 = self._weight(self.h3[:, :-1]).view(1, self.WIDTH)
         b3 = self._weight(self.h3[:, -1])
         return F.linear(a2, W3, b3)
 
-    # Try all possible codes at given index in a layer
-    def forward_with_h_change(self, layer_name, idx, X_train):
-        codes = torch.arange(self.K, device=device)
-
-        # Keep a copy
+    # Forward for a single candidate code at one weight
+    def forward_with_single_code(self, layer_name, idx, code, X_train):
         h_original = getattr(self, layer_name).copy()
-
-        # Expand into K versions
-        h_variants = np.repeat(h_original[np.newaxis, ...], self.K, axis=0)
-        h_variants[:, idx[0], idx[1]] = np.arange(self.K, dtype=np.uint8)
-
-        outputs = []
+        h = h_original.copy()
+        h[idx] = code
+        setattr(self, layer_name, h)
 
         if layer_name == 'h1':
-            for h in h_variants:
-                self.h1 = h
-                outputs.append(self.forward(X_train))
-
-        elif layer_name == 'h2':
-            # Cache a1 once
-            a1 = torch.tanh(F.linear(
-                X_train,
-                self._weight(self.h1[:, :-1]).view(self.WIDTH, 1),
-                self._weight(self.h1[:, -1])
-            ))
-            for h in h_variants:
-                self.h2 = h
-                outputs.append(self.forward_from_a1(a1))
-
-        elif layer_name == 'h3':
-            # Cache a1 and a2 once
+            # Recompute all
             a1 = torch.tanh(F.linear(
                 X_train,
                 self._weight(self.h1[:, :-1]).view(self.WIDTH, 1),
@@ -106,42 +88,134 @@ class LayerGridMLP:
                 self._weight(self.h2[:, :-1]).view(self.WIDTH, self.WIDTH),
                 self._weight(self.h2[:, -1])
             ))
-            for h in h_variants:
-                self.h3 = h
-                outputs.append(self.forward_from_a2(a2))
+            out = self.forward_from_a2(a2)
+            self.a1_cache = a1
+            self.a2_cache = a2
+            self.cache_valid = {'h1': True, 'h2': True, 'h3': False}
 
+        elif layer_name == 'h2':
+            # Use cached a1 if valid
+            if self.cache_valid['h1'] and self.a1_cache is not None:
+                a1 = self.a1_cache
+            else:
+                a1 = torch.tanh(F.linear(
+                    X_train,
+                    self._weight(self.h1[:, :-1]).view(self.WIDTH, 1),
+                    self._weight(self.h1[:, -1])
+                ))
+                self.a1_cache = a1
+                self.cache_valid['h1'] = True
+
+            a2 = torch.tanh(F.linear(
+                a1,
+                self._weight(self.h2[:, :-1]).view(self.WIDTH, self.WIDTH),
+                self._weight(self.h2[:, -1])
+            ))
+            out = self.forward_from_a2(a2)
+            self.a2_cache = a2
+            self.cache_valid['h2'] = True
+            self.cache_valid['h3'] = False
+
+        elif layer_name == 'h3':
+            # Use cached a2 if valid
+            if self.cache_valid['h2'] and self.a2_cache is not None:
+                a2 = self.a2_cache
+            else:
+                if self.cache_valid['h1'] and self.a1_cache is not None:
+                    a1 = self.a1_cache
+                else:
+                    a1 = torch.tanh(F.linear(
+                        X_train,
+                        self._weight(self.h1[:, :-1]).view(self.WIDTH, 1),
+                        self._weight(self.h1[:, -1])
+                    ))
+                    self.a1_cache = a1
+                    self.cache_valid['h1'] = True
+
+                a2 = torch.tanh(F.linear(
+                    a1,
+                    self._weight(self.h2[:, :-1]).view(self.WIDTH, self.WIDTH),
+                    self._weight(self.h2[:, -1])
+                ))
+                self.a2_cache = a2
+                self.cache_valid['h2'] = True
+
+            out = self.forward_from_a2(a2)
         else:
             raise ValueError(f"Unknown layer: {layer_name}")
 
-        # Restore original h
         setattr(self, layer_name, h_original)
-
-        return torch.stack(outputs, dim=0)  # shape: [K, N, 1]
-
+        return out
 
 # ------------------------------------------------------------------
-# Training loop
+# Binary search over the grid
+# ------------------------------------------------------------------
+def best_code_binary(model, layer_name, idx, X_train, Y_train):
+    lo, hi = 0, model.K - 1
+    best_code = lo
+    best_loss = float("inf")
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        out_mid = model.forward_with_single_code(layer_name, idx, mid, X_train)
+        loss_mid = F.mse_loss(out_mid, Y_train).item()
+
+        if mid + 1 <= hi:
+            out_next = model.forward_with_single_code(layer_name, idx, mid + 1, X_train)
+            loss_next = F.mse_loss(out_next, Y_train).item()
+        else:
+            loss_next = float("inf")
+
+        if loss_mid < best_loss:
+            best_loss = loss_mid
+            best_code = mid
+        if loss_next < best_loss:
+            best_loss = loss_next
+            best_code = mid + 1
+
+        if loss_next < loss_mid:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return best_code, best_loss
+
+# ------------------------------------------------------------------
+# Training loop with monotonic loss + cached activations
 # ------------------------------------------------------------------
 model = LayerGridMLP()
 losses = []
-n_iter = 1000
+n_iter = 2000
 
 for step in range(n_iter + 1):
-    for layer in ['h1', 'h2', 'h3']:
-        h = getattr(model, layer)
-        idx = tuple(np.unravel_index(np.random.randint(h.size), h.shape))
+    # pick one layer at random
+    layer = random.choice(['h1', 'h2', 'h3'])
+    h = getattr(model, layer)
+    idx = tuple(np.unravel_index(np.random.randint(h.size), h.shape))
 
-        out_all = model.forward_with_h_change(layer, idx, X_train)
-        mse_all = ((out_all - Y_train.unsqueeze(0)) ** 2).mean(dim=(1, 2))
-        best_code = torch.argmin(mse_all).item()
+    # compute old loss
+    old_code = h[idx]
+    out_old = model.forward_with_single_code(layer, idx, old_code, X_train)
+    loss_old = F.mse_loss(out_old, Y_train).item()
 
+    # binary search for best code
+    best_code, _ = best_code_binary(model, layer, idx, X_train, Y_train)
+
+    # compute new loss
+    out_new = model.forward_with_single_code(layer, idx, best_code, X_train)
+    loss_new = F.mse_loss(out_new, Y_train).item()
+
+    # commit if better
+    if loss_new < loss_old:
         getattr(model, layer)[idx] = best_code
+        final_loss = loss_new
+    else:
+        final_loss = loss_old
 
-    if step % 100 == 0:        
-        final_pred = out_all[best_code]  # from last layer update
-        loss = F.mse_loss(final_pred, Y_train).item()
-        losses.append(loss)
-        print(f"Iter {step:4d} | Loss {loss:.6f}")
+    # logging
+    if step % 100 == 0:
+        losses.append(final_loss)
+        print(f"Iter {step:4d} | Loss {final_loss:.6f}")
 
 # ------------------------------------------------------------------
 # Visualization
