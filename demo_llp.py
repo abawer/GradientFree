@@ -3,7 +3,7 @@ import numpy as np
 # --- 1. Toy dataset ---
 n_samples = 500
 input_dim = 50
-hidden_dims = [50]*10  # 10 layers with 50 units each
+hidden_dims = [10]*100  # 10 layers with 50 units each
 output_dim = 1
 
 X = np.random.randn(n_samples, input_dim)
