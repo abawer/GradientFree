@@ -1,47 +1,36 @@
 import numpy as np
 
-#np.random.seed(0)
-
 # --- 1. Toy dataset ---
-n_samples = 100
-input_dim = 5
-hidden_dims = [10,10,10,10,10]  # fewer layers for clarity
+n_samples = 500
+input_dim = 50
+hidden_dims = [50]*10  # 10 layers with 50 units each
 output_dim = 1
 
 X = np.random.randn(n_samples, input_dim)
-y = np.sin(X.sum(axis=1, keepdims=True))  # target
+y = np.sin(X.sum(axis=1, keepdims=True))
 
 # --- 2. Activation ---
 def tanh(x):
     return np.tanh(x)
 
-# --- 3. Generate hidden target with slight rotation ---
-def generate_H_rotated(H_input, y, h_dim, rotation_scale=0.1):
+# --- 3. Generate hidden targets from [H_input, y] only ---
+def generate_H(H_input, y, h_dim):
     XY = np.concatenate([H_input, y], axis=1)
-    n_cols = XY.shape[1]  # 6 here
+    n_cols = XY.shape[1]
 
-    # Original orthogonal directions
-    R_main = np.random.randn(n_cols, h_dim)
-    Q_main, _ = np.linalg.qr(R_main)
-
-    # Small rotation in input space (size n_cols x n_cols)
-    theta = rotation_scale
-    rotation_matrix = np.eye(n_cols) + theta * np.random.randn(n_cols, n_cols)
-    rotation_matrix, _ = np.linalg.qr(rotation_matrix)  # orthonormalize
-
-    # Rotate XY before projection
-    XY_rotated = XY @ rotation_matrix
-    H = XY_rotated @ Q_main
+    # Orthogonal projection
+    R_proj = np.random.randn(n_cols, h_dim)
+    Q, _ = np.linalg.qr(R_proj)
+    H = XY @ Q
     return H
 
-
-# --- 4. Layerwise training with plain residuals ---
-def train_layerwise_rotated(X, y, hidden_dims, rotation_scale=0.1):
+# --- 4. Layerwise training ---
+def train_layerwise(X, y, hidden_dims):
     layers = []
     H_input = X.copy()
 
     for h_dim in hidden_dims:
-        H_target = generate_H_rotated(H_input, y, h_dim, rotation_scale=rotation_scale)
+        H_target = generate_H(H_input, y, h_dim)
 
         # Center X and H
         X_mean = H_input.mean(axis=0, keepdims=True)
@@ -75,7 +64,7 @@ def train_layerwise_rotated(X, y, hidden_dims, rotation_scale=0.1):
     return layers
 
 # --- 5. Forward pass ---
-def forward_residual_rotated(X, layers):
+def forward_residual(X, layers):
     H = X.copy()
     for layer in layers[:-1]:
         W, b, E = layer
@@ -86,8 +75,8 @@ def forward_residual_rotated(X, layers):
     return y_pred
 
 # --- 6. Train and evaluate ---
-layers = train_layerwise_rotated(X, y, hidden_dims, rotation_scale=0.1)
-y_pred = forward_residual_rotated(X, layers)
+layers = train_layerwise(X, y, hidden_dims)
+y_pred = forward_residual(X, layers)
 
 print("True y[:5]:\n", y[:5])
 print("\nPred y_pred[:5]:\n", y_pred[:5])
