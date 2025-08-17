@@ -1,10 +1,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D   # noqa – needed for 3-D
+from mpl_toolkits.mplot3d import Axes3D
 
 # ---------------- Bucket ----------------
 class Bucket:
-    """Leaf or parent bucket with lazy linear regression"""
+    """Leaf or parent bucket with lazy linear regression + MSE-driven promotion"""
+    PROMOTE_M      = 32       # check every m new samples
+    PROMOTE_EPS    = 0.002     # promote if training MSE > eps
+    LAMBDA_REG     = 1e-3     # ridge regulariser
+
     def __init__(self, n_features, projections=None):
         self.n_features = n_features
         self.projections = [] if projections is None else list(projections)
@@ -14,11 +18,13 @@ class Bucket:
         self.children = {}  # hash_code -> Bucket
         self.W = None
         self.b = None
+        self._since_last_check = 0
 
     # ---------------- Add sample ----------------
     def add_sample(self, x, y):
         self.samples_X.append(x)
         self.samples_Y.append(y)
+        self._since_last_check += 1
 
     # ---------------- Promote leaf to parent ----------------
     def promote(self):
@@ -41,29 +47,47 @@ class Bucket:
         self.b = None
 
     # ---------------- Fit linear model lazily with ridge ----------------
-    def fit_linear(self, lambda_reg=1e-3):
+    def fit_linear(self):
         if not self.is_leaf:
             raise RuntimeError("fit_linear called on non-leaf bucket!")
         if len(self.samples_X) == 0:
             raise ValueError("Cannot fit linear model: leaf has zero samples!")
         X = np.array(self.samples_X)
         Y = np.array(self.samples_Y)
-        # append ones for bias
         X_aug = np.hstack([X, np.ones((X.shape[0], 1))])
-        # ridge-regularized solve
         Wb = np.linalg.inv(X_aug.T @ X_aug +
-                           lambda_reg * np.eye(X_aug.shape[1])) @ X_aug.T @ Y
+                           self.LAMBDA_REG * np.eye(X_aug.shape[1])) @ X_aug.T @ Y
         self.W = Wb[:-1]
         self.b = Wb[-1]
 
+    # ---------------- MSE on node’s own samples ----------------
+    def _mse_on_self(self):
+        """Return training-set MSE using current (W,b)."""
+        if len(self.samples_X) < 2 or self.W is None:
+            return np.inf
+        X = np.array(self.samples_X)
+        Y = np.array(self.samples_Y)
+        pred = X @ self.W + self.b
+        return float(np.mean((Y - pred) ** 2))
+
+    # ---------------- Decide promotion ----------------
+    def maybe_promote(self):
+        """Return True if promotion triggered."""
+        if not self.is_leaf or self._since_last_check < self.PROMOTE_M:
+            return False
+        self._since_last_check = 0
+        self.fit_linear()
+        if self._mse_on_self() > self.PROMOTE_EPS:
+            self.promote()
+            return True
+        return False
 
 # ---------------- Adaptive Hierarchical Hash Regressor ----------------
 class AdaptiveHierarchicalHashRegressor:
-    def __init__(self, max_samples_per_bucket=50):
+    def __init__(self):
         self.root = None
         self.x_min = None
         self.x_max = None
-        self.samples_per_bucket = max_samples_per_bucket
 
     def _normalize(self, X):
         return (X - self.x_min) / (self.x_max - self.x_min + 1e-12) * 2 - 1
@@ -78,25 +102,23 @@ class AdaptiveHierarchicalHashRegressor:
         if self.root is None:
             self.root = Bucket(n_features)
 
-        # Route samples to leaves
         for i in range(n_samples):
             x_i, y_i = X_norm[i], Y[i]
             bucket = self._route_to_leaf(x_i, create=True)
             bucket.add_sample(x_i, y_i)
-            # optional promotion
-            if len(bucket.samples_X) > self.samples_per_bucket:
-                bucket.promote()
+            bucket.maybe_promote()
 
-        # After all samples are routed, fit leaf models
-        self._fit_all_leaves(self.root)
+        self._fit_all_leaves_and_clear_samples(self.root)
 
-    def _fit_all_leaves(self, bucket):
+    def _fit_all_leaves_and_clear_samples(self, bucket):
         if bucket.is_leaf:
             bucket.fit_linear()
+            bucket.samples_X = []
+            bucket.samples_Y = []
         else:
             for child in bucket.children.values():
-                self._fit_all_leaves(child)
-
+                self._fit_all_leaves_and_clear_samples(child)
+    
     # ---------------- Routing ----------------
     def _route_to_leaf(self, x, create=False):
         bucket = self.root
@@ -107,8 +129,8 @@ class AdaptiveHierarchicalHashRegressor:
             hash_code = int(np.floor(proj_val))
             if hash_code not in bucket.children:
                 if create:
-                    bucket.children[hash_code] = Bucket(
-                        bucket.n_features, projections=bucket.projections.copy())
+                    bucket.children[hash_code] = Bucket(bucket.n_features,
+                                                        projections=bucket.projections.copy())
                 else:
                     existing_hashes = np.array(list(bucket.children.keys()))
                     if len(existing_hashes) == 0:
@@ -133,10 +155,9 @@ class AdaptiveHierarchicalHashRegressor:
         Y_pred = self.predict(X)
         return np.mean((Y - Y_pred) ** 2)
 
-
 # ---------------- Demo ----------------
 if __name__ == "__main__":
-    ###np.random.seed(0)
+    np.random.seed(0)
 
     # 1. Generate data
     n_samples = 5000
@@ -148,10 +169,10 @@ if __name__ == "__main__":
     idx = np.random.permutation(n_samples)
     tsize = int(0.8 * n_samples)
     X_train, Y_train = X[idx[:tsize]], Y[idx[:tsize]]
-    X_test, Y_test = X[idx[tsize:]], Y[idx[tsize:]]
+    X_test,  Y_test  = X[idx[tsize:]], Y[idx[tsize:]]
 
     # 3. Fit model
-    model = AdaptiveHierarchicalHashRegressor(max_samples_per_bucket=50)
+    model = AdaptiveHierarchicalHashRegressor()
     model.fit(X_train, Y_train)
 
     # 4. Evaluate
@@ -170,23 +191,17 @@ if __name__ == "__main__":
 
     # ---- 5b. Predicted surface (mesh) ----
     ax2 = fig.add_subplot(122, projection='3d')
-
-    # grid spanning the test set domain
     x0_min, x0_max = X_test[:, 0].min(), X_test[:, 0].max()
     x1_min, x1_max = X_test[:, 1].min(), X_test[:, 1].max()
-
     u = np.linspace(x0_min, x0_max, 100)
     v = np.linspace(x1_min, x1_max, 100)
     U, V = np.meshgrid(u, v)
     grid = np.c_[U.ravel(), V.ravel()]
-
     Z_pred = model.predict(grid).reshape(U.shape)
-
     ax2.plot_surface(U, V, Z_pred, cmap='viridis', alpha=0.7)
     ax2.scatter(X_test[:, 0], X_test[:, 1], Y_test,
                 s=6, color='r', alpha=0.5)
     ax2.set_title("Predicted surface + true test points")
     ax2.set_xlabel('x0'); ax2.set_ylabel('x1'); ax2.set_zlabel('Y')
-
     plt.tight_layout()
     plt.show()
