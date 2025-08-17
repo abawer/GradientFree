@@ -124,7 +124,7 @@ class AdaptiveHierarchicalHashRegressor:
 
 # ---------------- Demo ----------------
 if __name__ == "__main__":
-    np.random.seed(0)
+    ##np.random.seed(0)
     n_samples = 5000
     X = np.random.uniform(-2, 2, size=(n_samples, 2))
     Y = (np.sin(X[:,0]) + X[:,1]**2).reshape(-1,1) + 0.05*np.random.randn(n_samples,1)
@@ -134,7 +134,7 @@ if __name__ == "__main__":
     X_train, Y_train = X[idx[:tsize]], Y[idx[:tsize]]
     X_test, Y_test = X[idx[tsize:]], Y[idx[tsize:]]
 
-    model = AdaptiveHierarchicalHashRegressor(max_samples_per_bucket=5)
+    model = AdaptiveHierarchicalHashRegressor(max_samples_per_bucket=50)
     model.fit(X_train, Y_train)
     print("Train MSE:", model.mse(X_train, Y_train))
     print("Test  MSE:", model.mse(X_test, Y_test))
