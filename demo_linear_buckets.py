@@ -49,11 +49,11 @@ class Bucket:
         self.b = Wb[-1]
 
 class AdaptiveHierarchicalHashRegressor:
-    def __init__(self, error_threshold=0.01):
-        self.error_threshold = error_threshold
+    def __init__(self, max_samples_per_bucket=10):
         self.root = None
         self.x_min = None
         self.x_max = None
+        self.samples_per_bucket = max_samples_per_bucket
 
     def _normalize(self, X):
         return (X - self.x_min) / (self.x_max - self.x_min + 1e-12) * 2 - 1
@@ -74,7 +74,8 @@ class AdaptiveHierarchicalHashRegressor:
             bucket = self._route_to_leaf(x_i, create=True)
             bucket.add_sample(x_i, y_i)
             # optional promotion
-            if len(bucket.samples_X) > 10:  # example threshold
+            if len(bucket.samples_X) > self.samples_per_bucket:  # example threshold
+                #print("splitting")
                 bucket.promote()
 
         # After all samples are routed, fit leaf models
@@ -113,7 +114,7 @@ class AdaptiveHierarchicalHashRegressor:
             if bucket.W is not None:
                 Y_pred.append(float(x @ bucket.W + bucket.b))
             else:
-                print("no pred")
+                print("no pred!")
                 Y_pred.append(0.0)
         return np.array(Y_pred).reshape(-1,1)
 
@@ -133,7 +134,7 @@ if __name__ == "__main__":
     X_train, Y_train = X[idx[:tsize]], Y[idx[:tsize]]
     X_test, Y_test = X[idx[tsize:]], Y[idx[tsize:]]
 
-    model = AdaptiveHierarchicalHashRegressor(error_threshold=0.1)
+    model = AdaptiveHierarchicalHashRegressor(max_samples_per_bucket=5)
     model.fit(X_train, Y_train)
     print("Train MSE:", model.mse(X_train, Y_train))
     print("Test  MSE:", model.mse(X_test, Y_test))
