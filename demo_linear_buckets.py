@@ -1,4 +1,6 @@
 import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D   # noqa – needed for 3-D
 
 # ---------------- Bucket ----------------
 class Bucket:
@@ -29,7 +31,8 @@ class Bucket:
         for x, y in zip(self.samples_X, self.samples_Y):
             hash_code = int(np.floor(x @ new_proj))
             if hash_code not in self.children:
-                self.children[hash_code] = Bucket(self.n_features, projections=self.projections.copy())
+                self.children[hash_code] = Bucket(self.n_features,
+                                                  projections=self.projections.copy())
             self.children[hash_code].add_sample(x, y)
         # clear parent’s old leaf data
         self.samples_X = []
@@ -46,11 +49,13 @@ class Bucket:
         X = np.array(self.samples_X)
         Y = np.array(self.samples_Y)
         # append ones for bias
-        X_aug = np.hstack([X, np.ones((X.shape[0],1))])
+        X_aug = np.hstack([X, np.ones((X.shape[0], 1))])
         # ridge-regularized solve
-        Wb = np.linalg.inv(X_aug.T @ X_aug + lambda_reg*np.eye(X_aug.shape[1])) @ X_aug.T @ Y
+        Wb = np.linalg.inv(X_aug.T @ X_aug +
+                           lambda_reg * np.eye(X_aug.shape[1])) @ X_aug.T @ Y
         self.W = Wb[:-1]
         self.b = Wb[-1]
+
 
 # ---------------- Adaptive Hierarchical Hash Regressor ----------------
 class AdaptiveHierarchicalHashRegressor:
@@ -102,7 +107,8 @@ class AdaptiveHierarchicalHashRegressor:
             hash_code = int(np.floor(proj_val))
             if hash_code not in bucket.children:
                 if create:
-                    bucket.children[hash_code] = Bucket(bucket.n_features, projections=bucket.projections.copy())
+                    bucket.children[hash_code] = Bucket(
+                        bucket.n_features, projections=bucket.projections.copy())
                 else:
                     existing_hashes = np.array(list(bucket.children.keys()))
                     if len(existing_hashes) == 0:
@@ -121,31 +127,66 @@ class AdaptiveHierarchicalHashRegressor:
             if bucket.W is None:
                 raise RuntimeError("Predicting from leaf without model!")
             Y_pred.append((x @ bucket.W + bucket.b).item())
-        return np.array(Y_pred).reshape(-1,1)
+        return np.array(Y_pred).reshape(-1, 1)
 
     def mse(self, X, Y):
         Y_pred = self.predict(X)
-        return np.mean((Y - Y_pred)**2)
+        return np.mean((Y - Y_pred) ** 2)
+
 
 # ---------------- Demo ----------------
 if __name__ == "__main__":
-    ##np.random.seed(0)
+    ###np.random.seed(0)
 
-    # Generate 2D input
+    # 1. Generate data
     n_samples = 5000
     X = np.random.uniform(-2, 2, size=(n_samples, 2))
-    Y = (np.sin(X[:,0]) + X[:,1]**2).reshape(-1,1) + 0.05*np.random.randn(n_samples,1)
+    Y = (np.sin(X[:, 0]) + X[:, 1] ** 2).reshape(-1, 1) + \
+        0.05 * np.random.randn(n_samples, 1)
 
-    # Split train/test
+    # 2. Train/test split
     idx = np.random.permutation(n_samples)
     tsize = int(0.8 * n_samples)
     X_train, Y_train = X[idx[:tsize]], Y[idx[:tsize]]
     X_test, Y_test = X[idx[tsize:]], Y[idx[tsize:]]
 
-    # Initialize and fit model
+    # 3. Fit model
     model = AdaptiveHierarchicalHashRegressor(max_samples_per_bucket=50)
     model.fit(X_train, Y_train)
 
-    # Evaluate
+    # 4. Evaluate
     print("Train MSE:", model.mse(X_train, Y_train))
     print("Test  MSE:", model.mse(X_test, Y_test))
+
+    # 5. Plot: true test points + predicted surface on the same x/y axes
+    fig = plt.figure(figsize=(14, 5))
+
+    # ---- 5a. True test values (scatter) ----
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax1.scatter(X_test[:, 0], X_test[:, 1], Y_test,
+                s=8, c='k', alpha=0.6)
+    ax1.set_title("True test values")
+    ax1.set_xlabel('x0'); ax1.set_ylabel('x1'); ax1.set_zlabel('Y')
+
+    # ---- 5b. Predicted surface (mesh) ----
+    ax2 = fig.add_subplot(122, projection='3d')
+
+    # grid spanning the test set domain
+    x0_min, x0_max = X_test[:, 0].min(), X_test[:, 0].max()
+    x1_min, x1_max = X_test[:, 1].min(), X_test[:, 1].max()
+
+    u = np.linspace(x0_min, x0_max, 100)
+    v = np.linspace(x1_min, x1_max, 100)
+    U, V = np.meshgrid(u, v)
+    grid = np.c_[U.ravel(), V.ravel()]
+
+    Z_pred = model.predict(grid).reshape(U.shape)
+
+    ax2.plot_surface(U, V, Z_pred, cmap='viridis', alpha=0.7)
+    ax2.scatter(X_test[:, 0], X_test[:, 1], Y_test,
+                s=6, color='r', alpha=0.5)
+    ax2.set_title("Predicted surface + true test points")
+    ax2.set_xlabel('x0'); ax2.set_ylabel('x1'); ax2.set_zlabel('Y')
+
+    plt.tight_layout()
+    plt.show()
