@@ -1,106 +1,139 @@
 import numpy as np
-from collections import defaultdict
 
-class HashLinearRegressorSimple:
-    def __init__(self, n_hashes=8, bin_width=1.2):
-        self.n_hashes = n_hashes
-        self.bin_width = bin_width
-        self.projections = None
-        self.buckets = {}        # hash tuple -> (W, b)
-        self.bucket_codes = None
-        self.bucket_counts = {}  # hash tuple -> number of samples
+class Bucket:
+    """Leaf or parent bucket with lazy linear regression"""
+    def __init__(self, n_features, projections=None):
+        self.n_features = n_features
+        self.projections = [] if projections is None else list(projections)
+        self.is_leaf = True
+        self.samples_X = []
+        self.samples_Y = []
+        self.children = {}  # hash_code -> Bucket
+        self.W = None
+        self.b = None
 
-    def _hash(self, X):
-        codes = np.floor(X @ self.projections.T / self.bin_width).astype(int)
-        return [tuple(row) for row in codes]
+    # ---------------- Add sample ----------------
+    def add_sample(self, x, y):
+        self.samples_X.append(x)
+        self.samples_Y.append(y)
 
-    def _fit_linear(self, X, Y):
-        W = np.linalg.pinv(X) @ Y
-        b = np.zeros(Y.shape[1]) if Y.ndim > 1 else 0
-        return W, b
+    # ---------------- Promote leaf to parent ----------------
+    def promote(self):
+        if not self.is_leaf:
+            return  # already a parent
+        new_proj = np.random.randn(self.n_features)
+        self.projections.append(new_proj)
+        self.is_leaf = False
+        # redistribute samples into children
+        for x, y in zip(self.samples_X, self.samples_Y):
+            hash_code = int(np.floor(x @ new_proj))
+            if hash_code not in self.children:
+                self.children[hash_code] = Bucket(self.n_features, projections=self.projections.copy())
+            self.children[hash_code].add_sample(x, y)
+        # clear parent’s old leaf data
+        self.samples_X = []
+        self.samples_Y = []
+        self.W = None
+        self.b = None
 
+    # ---------------- Fit linear model lazily ----------------
+    def fit_linear(self):
+        if not self.is_leaf or len(self.samples_X) == 0:
+            return
+        X = np.array(self.samples_X)
+        Y = np.array(self.samples_Y)
+        # append ones for bias
+        X_aug = np.hstack([X, np.ones((X.shape[0],1))])
+        Wb = np.linalg.pinv(X_aug) @ Y
+        self.W = Wb[:-1]
+        self.b = Wb[-1]
+
+class AdaptiveHierarchicalHashRegressor:
+    def __init__(self, error_threshold=0.01):
+        self.error_threshold = error_threshold
+        self.root = None
+        self.x_min = None
+        self.x_max = None
+
+    def _normalize(self, X):
+        return (X - self.x_min) / (self.x_max - self.x_min + 1e-12) * 2 - 1
+
+    # ---------------- Training ----------------
     def fit(self, X, Y):
         n_samples, n_features = X.shape
-        self.projections = np.random.randn(self.n_hashes, n_features)
+        self.x_min = X.min(axis=0)
+        self.x_max = X.max(axis=0)
+        X_norm = self._normalize(X)
 
-        hash_codes = self._hash(X)
-        buckets_indices = defaultdict(list)
-        for i, code in enumerate(hash_codes):
-            buckets_indices[code].append(i)
+        if self.root is None:
+            self.root = Bucket(n_features)
 
-        for code, indices in buckets_indices.items():
-            X_bucket = X[indices]
-            Y_bucket = Y[indices]
-            W, b = self._fit_linear(X_bucket, Y_bucket)
-            self.buckets[code] = (W, b)
-            self.bucket_counts[code] = len(indices)
+        # Route samples to leaves
+        for i in range(n_samples):
+            x_i, y_i = X_norm[i], Y[i]
+            bucket = self._route_to_leaf(x_i, create=True)
+            bucket.add_sample(x_i, y_i)
+            # optional promotion
+            if len(bucket.samples_X) > 10:  # example threshold
+                bucket.promote()
 
-        self.bucket_codes = np.array(list(self.buckets.keys()))
+        # After all samples are routed, fit leaf models
+        self._fit_all_leaves(self.root)
 
-    def _nearest_bucket(self, code):
-        code_array = np.array(code)
-        dists = np.sum(np.abs(self.bucket_codes - code_array), axis=1)
-        nearest_idx = np.argmin(dists)
-        nearest_code = tuple(self.bucket_codes[nearest_idx])
-        return self.buckets[nearest_code]
+    def _fit_all_leaves(self, bucket):
+        if bucket.is_leaf:
+            bucket.fit_linear()
+        else:
+            for child in bucket.children.values():
+                self._fit_all_leaves(child)
 
+    # ---------------- Routing ----------------
+    def _route_to_leaf(self, x, create=False):
+        bucket = self.root
+        while not bucket.is_leaf:
+            proj_val = float(x @ bucket.projections[-1])
+            hash_code = int(np.floor(proj_val))
+            if hash_code not in bucket.children:
+                if create:
+                    bucket.children[hash_code] = Bucket(bucket.n_features, projections=bucket.projections.copy())
+                else:
+                    # fallback: closest sibling
+                    existing_hashes = np.array(list(bucket.children.keys()))
+                    nearest_idx = np.argmin(np.abs(existing_hashes - proj_val))
+                    hash_code = existing_hashes[nearest_idx]
+            bucket = bucket.children[hash_code]
+        return bucket
+
+    # ---------------- Prediction ----------------
     def predict(self, X):
-        hash_codes = self._hash(X)
+        X_norm = self._normalize(X)
         Y_pred = []
-        for i, code in enumerate(hash_codes):
-            W, b = self.buckets.get(code, self._nearest_bucket(code))
-            y = X[i] @ W + b
-            Y_pred.append(y)
-        return np.vstack(Y_pred)
+        for x in X_norm:
+            bucket = self._route_to_leaf(x, create=False)
+            if bucket.W is not None:
+                Y_pred.append(float(x @ bucket.W + bucket.b))
+            else:
+                print("no pred")
+                Y_pred.append(0.0)
+        return np.array(Y_pred).reshape(-1,1)
 
     def mse(self, X, Y):
         Y_pred = self.predict(X)
-        return np.mean((Y - Y_pred) ** 2)
-
-    # ---------------- Printing helpers ----------------
-    def print_bucket_counts(self):
-        print("Bucket counts (hash_code -> number of samples):")
-        for code, count in self.bucket_counts.items():
-            print(code, ":", count)
-
-    def print_bucket_histogram(self, bin_size=2):
-        counts = list(self.bucket_counts.values())
-        max_count = max(counts)
-        min_count = min(counts)
-
-        print("\nBucket size histogram:")
-        for size in range(min_count, max_count + 1, bin_size):
-            num_buckets = sum(1 for c in counts if size <= c < size + bin_size)
-            if num_buckets > 0:
-                print(f"Samples {size:3d}-{size+bin_size-1:3d}: {'*' * num_buckets} ({num_buckets} buckets)")
-
+        return np.mean((Y - Y_pred)**2)
 
 # ---------------- Demo ----------------
 if __name__ == "__main__":
     np.random.seed(0)
-
-    # Generate 2D input
     n_samples = 5000
-    tsize = int(0.8 * n_samples)
     X = np.random.uniform(-2, 2, size=(n_samples, 2))
-
-    # Non-linear target: sin(x0) + x1^2
     Y = (np.sin(X[:,0]) + X[:,1]**2).reshape(-1,1) + 0.05*np.random.randn(n_samples,1)
 
-    # Split train/test
     idx = np.random.permutation(n_samples)
-    train_idx, test_idx = idx[:tsize], idx[tsize:]
-    X_train, Y_train = X[train_idx], Y[train_idx]
-    X_test, Y_test = X[test_idx], Y[test_idx]
+    tsize = int(0.8 * n_samples)
+    X_train, Y_train = X[idx[:tsize]], Y[idx[:tsize]]
+    X_test, Y_test = X[idx[tsize:]], Y[idx[tsize:]]
 
-    # Initialize and fit model
-    model = HashLinearRegressorSimple(n_hashes=8, bin_width=1.2)
+    model = AdaptiveHierarchicalHashRegressor(error_threshold=0.1)
     model.fit(X_train, Y_train)
-
-    # Predict and evaluate
     print("Train MSE:", model.mse(X_train, Y_train))
     print("Test  MSE:", model.mse(X_test, Y_test))
-
-    # Print bucket info
-    model.print_bucket_counts()
-    model.print_bucket_histogram(bin_size=2)
