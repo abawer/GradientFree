@@ -1,5 +1,6 @@
 import numpy as np
 
+# ---------------- Bucket ----------------
 class Bucket:
     """Leaf or parent bucket with lazy linear regression"""
     def __init__(self, n_features, projections=None):
@@ -20,7 +21,7 @@ class Bucket:
     # ---------------- Promote leaf to parent ----------------
     def promote(self):
         if not self.is_leaf:
-            return  # already a parent
+            raise RuntimeError("Cannot promote: bucket is already a parent!")
         new_proj = np.random.randn(self.n_features)
         self.projections.append(new_proj)
         self.is_leaf = False
@@ -36,20 +37,24 @@ class Bucket:
         self.W = None
         self.b = None
 
-    # ---------------- Fit linear model lazily ----------------
-    def fit_linear(self):
-        if not self.is_leaf or len(self.samples_X) == 0:
-            return
+    # ---------------- Fit linear model lazily with ridge ----------------
+    def fit_linear(self, lambda_reg=1e-3):
+        if not self.is_leaf:
+            raise RuntimeError("fit_linear called on non-leaf bucket!")
+        if len(self.samples_X) == 0:
+            raise ValueError("Cannot fit linear model: leaf has zero samples!")
         X = np.array(self.samples_X)
         Y = np.array(self.samples_Y)
         # append ones for bias
         X_aug = np.hstack([X, np.ones((X.shape[0],1))])
-        Wb = np.linalg.pinv(X_aug) @ Y
+        # ridge-regularized solve
+        Wb = np.linalg.inv(X_aug.T @ X_aug + lambda_reg*np.eye(X_aug.shape[1])) @ X_aug.T @ Y
         self.W = Wb[:-1]
         self.b = Wb[-1]
 
+# ---------------- Adaptive Hierarchical Hash Regressor ----------------
 class AdaptiveHierarchicalHashRegressor:
-    def __init__(self, max_samples_per_bucket=10):
+    def __init__(self, max_samples_per_bucket=50):
         self.root = None
         self.x_min = None
         self.x_max = None
@@ -74,8 +79,7 @@ class AdaptiveHierarchicalHashRegressor:
             bucket = self._route_to_leaf(x_i, create=True)
             bucket.add_sample(x_i, y_i)
             # optional promotion
-            if len(bucket.samples_X) > self.samples_per_bucket:  # example threshold
-                #print("splitting")
+            if len(bucket.samples_X) > self.samples_per_bucket:
                 bucket.promote()
 
         # After all samples are routed, fit leaf models
@@ -91,15 +95,18 @@ class AdaptiveHierarchicalHashRegressor:
     # ---------------- Routing ----------------
     def _route_to_leaf(self, x, create=False):
         bucket = self.root
+        if bucket is None:
+            raise RuntimeError("Root bucket is None!")
         while not bucket.is_leaf:
-            proj_val = float(x @ bucket.projections[-1])
+            proj_val = (x @ bucket.projections[-1]).item()
             hash_code = int(np.floor(proj_val))
             if hash_code not in bucket.children:
                 if create:
                     bucket.children[hash_code] = Bucket(bucket.n_features, projections=bucket.projections.copy())
                 else:
-                    # fallback: closest sibling
                     existing_hashes = np.array(list(bucket.children.keys()))
+                    if len(existing_hashes) == 0:
+                        raise RuntimeError("No children to fallback to!")
                     nearest_idx = np.argmin(np.abs(existing_hashes - proj_val))
                     hash_code = existing_hashes[nearest_idx]
             bucket = bucket.children[hash_code]
@@ -111,11 +118,9 @@ class AdaptiveHierarchicalHashRegressor:
         Y_pred = []
         for x in X_norm:
             bucket = self._route_to_leaf(x, create=False)
-            if bucket.W is not None:
-                Y_pred.append(float(x @ bucket.W + bucket.b))
-            else:
-                print("no pred!")
-                Y_pred.append(0.0)
+            if bucket.W is None:
+                raise RuntimeError("Predicting from leaf without model!")
+            Y_pred.append((x @ bucket.W + bucket.b).item())
         return np.array(Y_pred).reshape(-1,1)
 
     def mse(self, X, Y):
@@ -125,16 +130,22 @@ class AdaptiveHierarchicalHashRegressor:
 # ---------------- Demo ----------------
 if __name__ == "__main__":
     ##np.random.seed(0)
+
+    # Generate 2D input
     n_samples = 5000
     X = np.random.uniform(-2, 2, size=(n_samples, 2))
     Y = (np.sin(X[:,0]) + X[:,1]**2).reshape(-1,1) + 0.05*np.random.randn(n_samples,1)
 
+    # Split train/test
     idx = np.random.permutation(n_samples)
     tsize = int(0.8 * n_samples)
     X_train, Y_train = X[idx[:tsize]], Y[idx[:tsize]]
     X_test, Y_test = X[idx[tsize:]], Y[idx[tsize:]]
 
+    # Initialize and fit model
     model = AdaptiveHierarchicalHashRegressor(max_samples_per_bucket=50)
     model.fit(X_train, Y_train)
+
+    # Evaluate
     print("Train MSE:", model.mse(X_train, Y_train))
     print("Test  MSE:", model.mse(X_test, Y_test))
