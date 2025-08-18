@@ -1,141 +1,111 @@
+# ======================================================================
+# 0.  Imports and MNIST (same as before)
+# ======================================================================
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 
-# ----------------------
-# 1. Load MNIST
-# ----------------------
 transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Lambda(lambda x: x.view(-1))
 ])
-train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-train_loader = DataLoader(train_dataset, batch_size=len(train_dataset))
-
-test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-test_loader = DataLoader(test_dataset, batch_size=len(test_dataset))
+train_loader = DataLoader(
+    datasets.MNIST('./data', train=True,  download=True, transform=transform),
+    batch_size=len(datasets.MNIST('./data', train=True))
+)
+test_loader = DataLoader(
+    datasets.MNIST('./data', train=False, download=True, transform=transform),
+    batch_size=len(datasets.MNIST('./data', train=False))
+)
 
 X_train, y_train = next(iter(train_loader))
-Y_train = torch.nn.functional.one_hot(y_train, num_classes=10).float()
-X_test, y_test = next(iter(test_loader))
-Y_test = torch.nn.functional.one_hot(y_test, num_classes=10).float()
+X_test,  y_test  = next(iter(test_loader))
+Y_train = torch.nn.functional.one_hot(y_train, 10).float()
+Y_test  = torch.nn.functional.one_hot(y_test,  10).float()
 
-# ----------------------
-# 2. Define layers
-# ----------------------
+# ======================================================================
+# 1.  Network definition
+# ======================================================================
 hidden_dims = [256, 128, 64]
-input_dim = X_train.shape[1]
-
-layers = [torch.randn(input_dim if i == 0 else hidden_dims[i-1], hidden_dims[i]) * 0.01
+layers = [torch.randn(X_train.shape[1] if i == 0 else hidden_dims[i-1],
+                      hidden_dims[i]) * 0.01
           for i in range(len(hidden_dims))]
-
-# Temporary heads (weights only, linear)
-temp_heads = [torch.zeros(h, Y_train.shape[1]) for h in hidden_dims]
-
-# Layer activation function
-def act(x): return torch.sigmoid(x)
-
-# ----------------------
-# 3. Train temporary heads per layer
-# ----------------------
+act = torch.sigmoid
 lambda_ridge = 1e-3
+k = 64   # shared low-rank
 
-H_in = X_train.clone()
-residual = Y_train.clone()
-
-for i, layer in enumerate(layers):
-    # Forward pass
-    H_out = act(H_in @ layer)
-
-    # Linear regression (ridge) for temporary head
-    HtH = H_out.T @ H_out + lambda_ridge * torch.eye(H_out.shape[1])
-    HtY = H_out.T @ residual
-    P_l = torch.linalg.solve(HtH, HtY)
-    temp_heads[i] = P_l
-
-    # Update residual
-    residual = residual - H_out @ P_l
-
-    # Next layer input
-    H_in = H_out
-
-# ----------------------
-# 4. Evaluate test accuracy with interim heads
-# ----------------------
-H_in = X_test.clone()
-Y_pred = torch.zeros_like(Y_test)
-
-for layer, P_l in zip(layers, temp_heads):
-    H_out = act(H_in @ layer)
-    Y_pred += H_out @ P_l
-    H_in = H_out
-
-acc = (Y_pred.argmax(dim=1) == y_test).float().mean()
-print(f"Test accuracy with interim heads: {acc:.4f}")
-
-# ------------------------------------------------------------------
-# 5.  Absorb all heads into ONE dense layer on CONCATENATED features
-# ------------------------------------------------------------------
-with torch.no_grad():
-    # 5-a  collect hidden activations for every layer
-    feats = [X_train]                  # input
-    h = X_train
-    for W in layers:
-        h = act(h @ W)
-        feats.append(h)                # after layer 0,1,2,…
-    H_cat = torch.cat(feats, dim=1)    # N × (d + h1 + … + hL)
-
-    # 5-b  target = greedy logits
-    target = torch.zeros_like(Y_train)
-    h = X_train
-    for W, P in zip(layers, temp_heads):
-        h = act(h @ W)
-        target += h @ P                # N × C
-
-    # 5-c  ridge regression to predict target from concatenated feats
-    reg = lambda_ridge * torch.eye(H_cat.shape[1], device=H_cat.device)
-    W_full = torch.linalg.solve(
-        H_cat.T @ H_cat + reg,
-        H_cat.T @ target)              # (d+h1+…) × C
-    b_full = target.mean(0) - (H_cat @ W_full).mean(0)
-
-# ------------------------------------------------------------------
-# 6.  Plain MLP that concatenates hidden vectors and applies W_full
-# ------------------------------------------------------------------
-def plain_mlp(x):
+# ======================================================================
+# 2.  Hidden states (train & test)
+# ======================================================================
+def hidden_states(x):
     feats = [x]
     h = x
     for W in layers:
         h = act(h @ W)
         feats.append(h)
-    h_cat = torch.cat(feats, dim=1)
-    return h_cat @ W_full + b_full
+    return feats
+
+H_train = hidden_states(X_train)
+H_test  = hidden_states(X_test)
+H_cat_train = torch.cat(H_train, dim=1)   # N × Σh_i
+
+# ======================================================================
+# 3.  Exact greedy logits (interim heads)
+# ======================================================================
+residual = Y_train.clone()
+logits_train = torch.zeros_like(Y_train)
+heads = []   # list of h_i×10 matrices
+
+for h_i in H_train[1:]:        # skip input
+    reg_i = lambda_ridge * torch.eye(h_i.shape[1])
+    P_i = torch.linalg.solve(h_i.T @ h_i + reg_i, h_i.T @ residual)
+    heads.append(P_i)
+    logits_train += h_i @ P_i
+    residual -= h_i @ P_i
+
+# test logits
+logits_test = torch.zeros_like(Y_test)
+for h_i, P in zip(hidden_states(X_test)[1:], heads):
+    logits_test += h_i @ P
+acc_interim = (logits_test.argmax(1) == y_test).float().mean()
+
+# ======================================================================
+# 4.  Low-rank absorption into ONE final layer
+# ======================================================================
+with torch.no_grad():
+    # Ridge on concatenated hidden states
+    reg = lambda_ridge * torch.eye(H_cat_train.shape[1])
+    W_full = torch.linalg.solve(H_cat_train.T @ H_cat_train + reg,
+                                H_cat_train.T @ logits_train)  # Σh_i×10
+
+    # SVD truncation to rank k
+    U, S, Vt = torch.linalg.svd(W_full, full_matrices=False)
+    W_low = U[:, :k] @ torch.diag(S[:k])   # Σh_i×k
+    B_low = Vt[:k]                        # k×10
+    b_final = logits_train.mean(0) - (H_cat_train @ W_full).mean(0)
+
+def low_rank_mlp(x):
+    h = torch.cat(hidden_states(x), dim=1)   # N×Σh_i
+    return (h @ W_low) @ B_low + b_final     # N×k @ k×10 → N×10
+
+acc_low = (low_rank_mlp(X_test).argmax(1) == y_test).float().mean()
+
+# ======================================================================
+# 5.  ELM baseline (ridge on last hidden layer only)
+# ======================================================================
+h_last_train = H_train[-1]
+h_last_test  = H_test[-1]
 
 with torch.no_grad():
-    logits = plain_mlp(X_test)
-    acc_plain = (logits.argmax(dim=1) == y_test).float().mean()
-    print(f"Test accuracy with absorbed layer: {acc_plain:.4f}")
+    reg = lambda_ridge * torch.eye(h_last_train.shape[1])
+    W_elm = torch.linalg.solve(h_last_train.T @ h_last_train + reg,
+                               h_last_train.T @ Y_train)
+    logits_elm = h_last_test @ W_elm
+    acc_elm = (logits_elm.argmax(1) == y_test).float().mean()
 
-# ------------------------------------------------------------------
-# 7.  Extreme Learning Machine (ELM) – head only on last hidden layer
-# ------------------------------------------------------------------
-with torch.no_grad():
-    # 7-a  last hidden representation
-    h = X_train
-    for W in layers:
-        h = act(h @ W)
-
-    # 7-b  ridge regression on last hidden → one-hot labels
-    reg = lambda_ridge * torch.eye(h.shape[1])
-    W_elm = torch.linalg.solve(h.T @ h + reg, h.T @ Y_train)
-    b_elm = Y_train.mean(0) - (h @ W_elm).mean(0)
-
-# 7-c  inference
-with torch.no_grad():
-    h = X_test
-    for W in layers:
-        h = act(h @ W)
-    logits_elm = h @ W_elm + b_elm
-    acc_elm = (logits_elm.argmax(dim=1) == y_test).float().mean()
-
-print(f"Test accuracy ELM (last-layer only): {acc_elm:.4f}")
+# ======================================================================
+# 6.  Print
+# ======================================================================
+print(f"Test accuracy interim heads:   {acc_interim:.4f}")
+print(f"Test accuracy low-rank MLP:    {acc_low:.4f}")
+print(f"Test accuracy ELM:             {acc_elm:.4f}")
