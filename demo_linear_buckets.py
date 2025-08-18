@@ -1,10 +1,13 @@
+"""
+Adaptive-Hierarchical-Hash Regressor – demo with leaf-region visualisation
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 # ---------------- Bucket ----------------
 class Bucket:
-    PROMOTE_EPS = 0.005
+    PROMOTE_EPS = 0.01
     MAX_DEPTH   = 40
     LAMBDA_REG  = 1e-3
 
@@ -68,7 +71,7 @@ class Bucket:
 
         for hc in np.unique(hash_codes):
             mask = hash_codes == hc
-            if mask.sum() == 0:          # skip empty children
+            if mask.sum() == 0:
                 continue
             child = Bucket(self.n_features,
                            projections=self.projections.copy(),
@@ -140,8 +143,20 @@ class AdaptiveHierarchicalHashRegressor:
         Y = np.asarray(Y, dtype=float).ravel()
         Y_pred = self.predict(X).ravel()
         return float(np.mean((Y - Y_pred) ** 2))
+    
+    # ----------------------------------------------------------
+    # Count leaves
+    # ----------------------------------------------------------
+    def count_leaves(self, node=None):
+        node = node or self.root
+        """Return the number of leaves in the tree rooted at *node*."""
+        if node.is_leaf:
+            return 1
+        return sum(self.count_leaves(child) for child in node.children.values())
 
-# ---------------- Demo ----------------
+# ----------------------------------------------------------
+# Demo
+# ----------------------------------------------------------
 if __name__ == "__main__":
     np.random.seed(0)
 
@@ -159,30 +174,84 @@ if __name__ == "__main__":
     # 3. Fit model
     model = AdaptiveHierarchicalHashRegressor()
     model.fit(X_train, Y_train)
-
+    print("Leaf count:", model.count_leaves())
     # 4. Evaluate
     print("Train MSE:", model.mse(X_train, Y_train))
     print("Test  MSE:", model.mse(X_test,  Y_test))
 
-    # 5. Plot
-    fig = plt.figure(figsize=(14, 5))
+    # ----------------------------------------------------------
+    # 5. Visualisation
+    # ----------------------------------------------------------
 
-    ax1 = fig.add_subplot(121, projection='3d')
-    ax1.scatter(X_test[:, 0], X_test[:, 1], Y_test, s=8, c='k', alpha=0.6)
-    ax1.set_title("True test values")
-    ax1.set_xlabel('x0'); ax1.set_ylabel('x1'); ax1.set_zlabel('Y')
-
-    ax2 = fig.add_subplot(122, projection='3d')
+    # 5a. Build a fine grid covering the test data range
     x0_min, x0_max = X_test[:, 0].min(), X_test[:, 0].max()
     x1_min, x1_max = X_test[:, 1].min(), X_test[:, 1].max()
-    u = np.linspace(x0_min, x0_max, 100)
-    v = np.linspace(x1_min, x1_max, 100)
+    u = np.linspace(x0_min, x0_max, 400)
+    v = np.linspace(x1_min, x1_max, 400)
     U, V = np.meshgrid(u, v)
     grid = np.c_[U.ravel(), V.ravel()]
-    Z_pred = model.predict(grid).reshape(U.shape)
+
+    # 5b. Map every grid point to its leaf
+    leaf_ids = np.empty(len(grid), dtype=int)
+    for i, pt in enumerate(grid):
+        leaf = model._route_to_leaf(model._normalize(pt.reshape(1, -1))[0])
+        leaf_ids[i] = id(leaf)
+    leaf_ids = leaf_ids.reshape(U.shape)
+
+    # 5c. Unique colour for every leaf
+    unique_ids = np.unique(leaf_ids)
+    id_to_colour = {uid: i % 20 for i, uid in enumerate(unique_ids)}
+    colour_map = np.vectorize(id_to_colour.get)(leaf_ids)
+
+    # 5d. 2-D heat-map of leaf regions
+    fig, ax = plt.subplots(1, 2, figsize=(14, 5))
+    ax0 = ax[0]
+    ax0.imshow(colour_map,
+               extent=[x0_min, x0_max, x1_min, x1_max],
+               origin='lower',
+               cmap='tab20',
+               aspect='auto')
+    ax0.set_title("Leaf regions (coloured by leaf id)")
+    ax0.set_xlabel('x0'); ax0.set_ylabel('x1')
+
+    # 5e. Overlay test points coloured by the same rule
+    test_leaf_ids = np.array([id(model._route_to_leaf(model._normalize(pt.reshape(1, -1))[0]))
+                              for pt in X_test])
+    test_colours = np.vectorize(id_to_colour.get)(test_leaf_ids)
+    ax0.scatter(X_test[:, 0], X_test[:, 1], c=test_colours, s=8,
+                edgecolors='k', linewidths=0.2)
+
+    # 5f. Draw the splitting boundaries (optional)
+    def draw_boundaries(node):
+        if node.is_leaf:
+            return
+        w = node.projections[-1]
+        # map back to original scale
+        w_orig = w / (model.x_max - model.x_min + 1e-12) * 2
+        a, b = w_orig[0], w_orig[1]
+        thresholds = sorted(node.children.keys())
+        xs = np.linspace(x0_min, x0_max, 400)
+        for k in thresholds:
+            if abs(b) > 1e-8:
+                ys = (k - a * xs) / b
+                ys = np.clip(ys, x1_min, x1_max)
+                ax0.plot(xs, ys, 'k-', linewidth=0.5, alpha=0.4)
+            elif abs(a) > 1e-8:
+                xs_line = k / a
+                if x0_min <= xs_line <= x0_max:
+                    ax0.axvline(xs_line, color='k', linewidth=0.5, alpha=0.4)
+        for child in node.children.values():
+            draw_boundaries(child)
+
+    draw_boundaries(model.root)
+
+    # 5g. 3-D surface on the right
+    ax2 = fig.add_subplot(122, projection='3d')
+    Z_pred = model.predict(np.c_[U.ravel(), V.ravel()]).reshape(U.shape)
     ax2.plot_surface(U, V, Z_pred, cmap='viridis', alpha=0.7)
     ax2.scatter(X_test[:, 0], X_test[:, 1], Y_test, s=6, color='r', alpha=0.5)
     ax2.set_title("Predicted surface + true test points")
     ax2.set_xlabel('x0'); ax2.set_ylabel('x1'); ax2.set_zlabel('Y')
+
     plt.tight_layout()
     plt.show()
