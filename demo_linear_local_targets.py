@@ -14,7 +14,7 @@ Y_tr = enc.fit_transform(y_tr.reshape(-1, 1))
 C = Y_tr.shape[1]
 
 LAYERS = [1024, 512, 256, 128, 64]
-ALPHA   = 1e-5
+ALPHA   = 1e-7
 SEED    = 42
 rng = np.random.default_rng(SEED)
 
@@ -31,18 +31,27 @@ def ridge_solve(A, T, alpha):
 start = time.time()
 H_tr = add_bias(X_tr)   # (60000, 785)
 H_te = add_bias(X_te)   # (10000, 785)
-for d_out in LAYERS:
-    # random targets
-    W_y = rng.standard_normal((C, d_out), dtype=np.float64) / np.sqrt(C)
-    T   = Y_tr.astype(np.float64) @ W_y
 
-    # ridge weights on current (biased) features
+RANK = 32               # low-rank bottleneck
+for d_out in LAYERS:
+    d_in = H_tr.shape[1]
+
+    # low-rank projection  Z = H @ G1 @ G2
+    G1 = rng.standard_normal((d_in, RANK)) * np.sqrt(2.0 / d_in)
+    G2 = rng.standard_normal((RANK, d_out)) * np.sqrt(1.0 / RANK)
+    Z  = (H_tr @ G1) @ G2
+
+    mu = np.zeros((C, d_out))
+    for c in range(C):
+        mask = (y_tr == str(c))
+        mu[c] = Z[mask].mean(axis=0)
+    T = mu[y_tr.astype(int)]
+
     W = ridge_solve(H_tr, T, ALPHA * d_out)
 
-    # forward pass: add bias to hidden state after activation for next layer
     H_tr = add_bias(activation(H_tr @ W))
     H_te = add_bias(activation(H_te @ W))
-
+    
     print(f"Layer {d_out} done.  shapes: {H_tr.shape}, {H_te.shape}")
 
 # output layer
