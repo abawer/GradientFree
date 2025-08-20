@@ -5,7 +5,7 @@ from sklearn.metrics import accuracy_score
 import time
 
 X, y = fetch_openml('mnist_784', version=1, return_X_y=True, as_frame=False)
-X = X.astype(np.float32) / 255.0
+X = X.astype(np.float64) / 255.0
 X_tr, X_te = X[:60000], X[60000:]
 y_tr, y_te = y[:60000], y[60000:]
 
