@@ -24,7 +24,8 @@ y_tr, y_te = y[:split], y[split:]
 # 2. Hyper-parameters -----------------------------------------------
 LAYERS = [512, 256, 128, 64]
 ALPHA  = 1e-10
-RANK   = 64
+BASE_RANK = 64
+MIN_RANK = 16
 SEED   = 42
 rng    = np.random.default_rng(SEED)
 
@@ -39,16 +40,18 @@ start_proposed = time.time()
 H_tr_proposed = add_bias(X_tr)   # (n_train, 9)
 H_te_proposed = add_bias(X_te)   # (n_test , 9)
 
-for width in LAYERS:          # hidden widths
+for i, width in enumerate(LAYERS):          # hidden widths
     d_in  = H_tr_proposed.shape[1]
-    d_out = width             # neurons in THIS hidden layer
-
+    
+    # Calculate adaptive rank for this layer
+    current_rank = max(MIN_RANK, BASE_RANK // (2 ** i))
+    
     # rank-1 random target (scalar stretched to `width` dimensions)
     p = rng.standard_normal((width, 1)) / np.sqrt(width)
     T = y_tr.reshape(-1, 1) @ p.T        # (n_samples, width)
 
-    # low-rank ALS
-    U = rng.standard_normal((d_in, RANK)) * np.sqrt(2.0 / d_in)
+    # low-rank ALS with adaptive rank
+    U = rng.standard_normal((d_in, current_rank)) * np.sqrt(2.0 / d_in)
     Z = H_tr_proposed @ U
     V = ridge_solve(Z, T, ALPHA)
     U = ridge_solve(H_tr_proposed, T @ V.T, ALPHA)
@@ -98,7 +101,7 @@ time_elm = time.time() - start_elm
 
 # Print results
 print("=" * 50)
-print("COMPARISON RESULTS")
+print("COMPARISON RESULTS WITH ADAPTIVE RANK")
 print("=" * 50)
 print(f"Proposed Method:")
 print(f"  MSE  = {mse_proposed:.4f}")
