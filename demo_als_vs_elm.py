@@ -1,12 +1,19 @@
 import numpy as np
 from sklearn.datasets import fetch_california_housing
 from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler
 import time
 
 # 1. Regression data -------------------------------------------------
 X, y = fetch_california_housing(return_X_y=True)
 X = X.astype(np.float64)
 y = y.astype(np.float64)
+
+# Standardize data
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+X = scaler_X.fit_transform(X)
+y = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
 
 # simple 80 / 20 split
 n = len(X)
@@ -51,11 +58,16 @@ for width in LAYERS:          # hidden widths
     H_te_proposed = add_bias(activation(H_te_proposed @ W))
 
 # 4. Final scalar regression
-W_out_proposed = ridge_solve(H_tr_proposed, y_tr.reshape(-1, 1))
+FINAL_ALPHA = 1e-3
+W_out_proposed = ridge_solve(H_tr_proposed, y_tr.reshape(-1, 1), alpha=FINAL_ALPHA)
 y_pred_proposed = H_te_proposed @ W_out_proposed
 y_pred_proposed = y_pred_proposed.flatten()
 
-mse_proposed = mean_squared_error(y_te, y_pred_proposed)
+# Convert back to original scale for MSE calculation
+y_pred_proposed = scaler_y.inverse_transform(y_pred_proposed.reshape(-1, 1)).flatten()
+y_te_orig = scaler_y.inverse_transform(y_te.reshape(-1, 1)).flatten()
+
+mse_proposed = mean_squared_error(y_te_orig, y_pred_proposed)
 time_proposed = time.time() - start_proposed
 
 # ELM Implementation for Comparison
@@ -74,11 +86,14 @@ for width in LAYERS:
     H_te_elm = add_bias(activation(H_te_elm @ W_elm))
 
 # Final output layer
-W_out_elm = ridge_solve(H_tr_elm, y_tr.reshape(-1, 1))
+W_out_elm = ridge_solve(H_tr_elm, y_tr.reshape(-1, 1), alpha=FINAL_ALPHA)
 y_pred_elm = H_te_elm @ W_out_elm
 y_pred_elm = y_pred_elm.flatten()
 
-mse_elm = mean_squared_error(y_te, y_pred_elm)
+# Convert back to original scale
+y_pred_elm = scaler_y.inverse_transform(y_pred_elm.reshape(-1, 1)).flatten()
+
+mse_elm = mean_squared_error(y_te_orig, y_pred_elm)
 time_elm = time.time() - start_elm
 
 # Print results
