@@ -1,193 +1,206 @@
+"""
+Fashion-MNIST single-run comparison
+- Proposed (low-rank ALS)
+- Forward Propagation (Saade et al.)
+- Plain ELM
+- ELM-X (orthogonal full-width + LWLR head)
+"""
+
 import numpy as np
-from sklearn.datasets import fetch_california_housing
-from sklearn.metrics import mean_squared_error
-from sklearn.preprocessing import StandardScaler
-from sklearn.neural_network import MLPRegressor
+from sklearn.datasets import fetch_openml
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelBinarizer
+from sklearn.metrics import accuracy_score
 import time
 
-# 1. Regression data -------------------------------------------------
-X, y = fetch_california_housing(return_X_y=True)
-X = X.astype(np.float64)
-y = y.astype(np.float64)
+# -----------------------------------------------------------
+# 1. Data utilities
+# -----------------------------------------------------------
+def load_fmnist():
+    X, y = fetch_openml('Fashion-MNIST', version=1, return_X_y=True)
+    X = X.astype(np.float32) / 255.0
+    y = y.astype(int)
+    lb = LabelBinarizer()
+    y_onehot = lb.fit_transform(y)
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y_onehot, test_size=0.2, random_state=42)
+    scaler = StandardScaler()
+    X_tr = scaler.fit_transform(X_tr)
+    X_te = scaler.transform(X_te)
+    return X_tr, X_te, y_tr, y_te, lb
 
-# Standardize data
-scaler_X = StandardScaler()
-scaler_y = StandardScaler()
-X = scaler_X.fit_transform(X)
-y = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+# -----------------------------------------------------------
+# 2. Helper functions
+# -----------------------------------------------------------
+def add_bias(x):
+    return np.hstack([x, np.ones((x.shape[0], 1), dtype=x.dtype)])
 
-# simple 80 / 20 split
-n = len(X)
-split = int(0.8 * n)
-X_tr, X_te = X[:split], X[split:]
-y_tr, y_te = y[:split], y[split:]
+def ridge_solve(A, T, alpha=1e-5):
+    AtA = A.T @ A + alpha * np.eye(A.shape[1], dtype=A.dtype)
+    return np.linalg.solve(AtA, A.T @ T)
 
-# 2. Hyper-parameters -----------------------------------------------
-LAYERS = [128, 64]
-ALPHA = 1e-5
-BASE_RANK = 64
-MIN_RANK = 16
-SEED = 42
-rng = np.random.default_rng(SEED)
+def softmax(x):
+    e = np.exp(x - np.max(x, axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
 
-def activation(x): return np.maximum(0, x)  # ReLU for our method
-def add_bias(x): return np.hstack([x, np.ones((x.shape[0], 1), dtype=np.float64)])
-def g_l(x): return np.tanh(x)  # Non-linear function for FP method
+# -----------------------------------------------------------
+# 3. Algorithms
+# -----------------------------------------------------------
+# 3.1 Low-rank ALS (memory-safe)
+def proposed_method_classification(
+        X_tr, X_te, y_tr, layers,
+        alpha=1e-5, seed=42):
 
-def ridge_solve(A, T, alpha=ALPHA):
-    # More stable ridge regression using SVD
-    U, s, Vt = np.linalg.svd(A, full_matrices=False)
-    s = s / (s**2 + alpha)
-    return Vt.T @ np.diag(s) @ U.T @ T
+    rng = np.random.default_rng(seed)
+    act = lambda x: np.maximum(0, x)
 
-# 3. Proposed Method (Low-Rank ALS) Training loop ----------------------------------------------------
-start_proposed = time.time()
-H_tr_proposed = add_bias(X_tr)
-H_te_proposed = add_bias(X_te)
+    H_tr = add_bias(X_tr)
+    H_te = add_bias(X_te)
 
-for i, width in enumerate(LAYERS):
-    d_in = H_tr_proposed.shape[1]
-    
-    # Calculate adaptive rank for this layer
-    current_rank = max(MIN_RANK, BASE_RANK // (2 ** i))
-    
-    # rank-1 random target (scalar stretched to `width` dimensions)
-    p = rng.standard_normal((width, 1)) / np.sqrt(width)
-    T = y_tr.reshape(-1, 1) @ p.T
+    C = y_tr.shape[1]
+    rank = 512                     # large enough sketch
+    min_rank = C
 
-    # low-rank ALS with adaptive rank
-    U = rng.standard_normal((d_in, current_rank)) * np.sqrt(2.0 / d_in)
-    Z = H_tr_proposed @ U
-    V = ridge_solve(Z, T)
-    U = ridge_solve(H_tr_proposed, T @ V.T)
-    W = U @ V
+    for width in layers:
+        d_in = H_tr.shape[1]
+        r = max(C, int(np.sqrt(width)))        # identical rule for factors
 
-    H_tr_proposed = add_bias(activation(H_tr_proposed @ W))
-    H_te_proposed = add_bias(activation(H_te_proposed @ W))
+        # low-rank target factors
+        P_l = rng.standard_normal((C, r)) * np.sqrt(2.0 / C)
+        P_r = rng.standard_normal((r, width)) * np.sqrt(2.0 / r)
+        Z = H_tr @ rng.standard_normal((d_in, r)) * np.sqrt(2.0 / d_in)
 
-# Final scalar regression
-FINAL_ALPHA = 1e-3
-W_out_proposed = ridge_solve(H_tr_proposed, y_tr.reshape(-1, 1), alpha=FINAL_ALPHA)
-y_pred_proposed = H_te_proposed @ W_out_proposed
-y_pred_proposed = y_pred_proposed.flatten()
+        V = ridge_solve(Z, y_tr @ P_l, alpha) @ P_r
+        tmp = P_r @ V.T
+        U = ridge_solve(H_tr, y_tr @ P_l @ tmp, alpha)
+        W = U @ V
 
-# Convert back to original scale for MSE calculation
-y_pred_proposed = scaler_y.inverse_transform(y_pred_proposed.reshape(-1, 1)).flatten()
-y_te_orig = scaler_y.inverse_transform(y_te.reshape(-1, 1)).flatten()
+        H_tr = add_bias(act(H_tr @ W))
+        H_te = add_bias(act(H_te @ W))
 
-mse_proposed = mean_squared_error(y_te_orig, y_pred_proposed)
-time_proposed = time.time() - start_proposed
+        rank = max(rank // 2, min_rank)
 
-# ELM Implementation for Comparison
-start_elm = time.time()
-H_tr_elm = add_bias(X_tr)
-H_te_elm = add_bias(X_te)
+    W_out = ridge_solve(H_tr, y_tr, alpha=1e-3)
+    return softmax(H_te @ W_out)
 
-for width in LAYERS:
-    d_in = H_tr_elm.shape[1]
-    
-    # ELM uses completely random weights (no training)
-    W_elm = rng.standard_normal((d_in, width)) * np.sqrt(2.0 / d_in)
-    
-    # Forward pass
-    H_tr_elm = add_bias(activation(H_tr_elm @ W_elm))
-    H_te_elm = add_bias(activation(H_te_elm @ W_elm))
+# 3.2 Forward Propagation (Saade et al.)
+def forward_propagation_classification(
+        X_tr, X_te, y_tr, layers,
+        alpha=1e-5, seed=42):
 
-# Final output layer
-W_out_elm = ridge_solve(H_tr_elm, y_tr.reshape(-1, 1), alpha=FINAL_ALPHA)
-y_pred_elm = H_te_elm @ W_out_elm
-y_pred_elm = y_pred_elm.flatten()
+    rng = np.random.default_rng(seed)
+    act = lambda x: np.maximum(0, x)
 
-# Convert back to original scale
-y_pred_elm = scaler_y.inverse_transform(y_pred_elm.reshape(-1, 1)).flatten()
+    H_tr = add_bias(X_tr)
+    H_te = add_bias(X_te)
 
-mse_elm = mean_squared_error(y_te_orig, y_pred_elm)
-time_elm = time.time() - start_elm
+    C = y_tr.shape[1]
 
-# Saade's Forward Projection (FP) Method Implementation
-start_fp = time.time()
-A_tr_fp = X_tr  # Input layer activations (no bias yet)
-A_te_fp = X_te
+    for width in layers:
+        d_in = H_tr.shape[1]
 
-for i, width in enumerate(LAYERS):
-    d_in = A_tr_fp.shape[1]
-    
-    # 1. Create fixed random projection matrices Q_l and U_l
-    # Q_l: projects from previous layer dimension to current layer dimension
-    Q_l = rng.standard_normal((d_in, width)) / np.sqrt(d_in)
-    # U_l: projects from output dimension (1) to current layer dimension
-    U_l = rng.standard_normal((1, width)) / np.sqrt(1)
-    
-    # 2. Generate target potentials Z̃_l = g_l(A_{l-1} Q_l) + g_l(y U_l)
-    Z_tilde = g_l(A_tr_fp @ Q_l) + g_l(y_tr.reshape(-1, 1) @ U_l)
-    
-    # 3. Solve for weights using ridge regression: W_l = (A_{l-1}^T A_{l-1} + λI)^{-1} (A_{l-1}^T Z̃_l)
-    W_fp = ridge_solve(A_tr_fp, Z_tilde)
-    
-    # 4. Forward pass: a_l = f_l(a_{l-1} W_l) - Using tanh as in the paper
-    A_tr_fp = np.tanh(A_tr_fp @ W_fp)
-    A_te_fp = np.tanh(A_te_fp @ W_fp)
+        Q = rng.normal(0, 1 / np.sqrt(d_in), (d_in, width))
+        U = rng.normal(0, 1 / np.sqrt(C), (C, width))
 
-# Final output layer - use ridge regression to map from last hidden layer to output
-W_out_fp = ridge_solve(A_tr_fp, y_tr.reshape(-1, 1), alpha=FINAL_ALPHA)
-y_pred_fp = A_te_fp @ W_out_fp
-y_pred_fp = y_pred_fp.flatten()
+        Z_tilde = np.sign(H_tr @ Q) + np.sign(y_tr @ U)
+        W_fp = ridge_solve(H_tr, Z_tilde, alpha)
 
-# Convert back to original scale
-y_pred_fp = scaler_y.inverse_transform(y_pred_fp.reshape(-1, 1)).flatten()
+        H_tr = add_bias(act(H_tr @ W_fp))
+        H_te = add_bias(act(H_te @ W_fp))
 
-mse_fp = mean_squared_error(y_te_orig, y_pred_fp)
-time_fp = time.time() - start_fp
+    W_out = ridge_solve(H_tr, y_tr, alpha=1e-3)
+    return softmax(H_te @ W_out)
 
-# Backpropagation (BP) Implementation for Comparison
-start_bp = time.time()
+# 3.3 Plain ELM
+def elm_method_classification(
+        X_tr, X_te, y_tr, layers,
+        alpha=1e-5, seed=42):
 
-# Create MLP with similar architecture
-bp_model = MLPRegressor(
-    hidden_layer_sizes=LAYERS,
-    activation='relu',
-    solver='adam',
-    alpha=1e-4,
-    batch_size='auto',
-    learning_rate='adaptive',
-    learning_rate_init=0.001,
-    max_iter=500,
-    random_state=SEED,
-    early_stopping=True,
-    n_iter_no_change=20,
-    validation_fraction=0.1
-)
+    rng = np.random.default_rng(seed)
+    act = lambda x: np.maximum(0, x)
 
-# Train the model
-bp_model.fit(X_tr, y_tr)
+    H_tr = add_bias(X_tr)
+    H_te = add_bias(X_te)
 
-# Make predictions
-y_pred_bp = bp_model.predict(X_te)
+    for width in layers:
+        d_in = H_tr.shape[1]
+        W = rng.standard_normal((d_in, width)) * np.sqrt(2.0 / d_in)
+        H_tr = add_bias(act(H_tr @ W))
+        H_te = add_bias(act(H_te @ W))
 
-# Convert back to original scale
-y_pred_bp = scaler_y.inverse_transform(y_pred_bp.reshape(-1, 1)).flatten()
+    W_out = ridge_solve(H_tr, y_tr, alpha=1e-3)
+    return softmax(H_te @ W_out)
 
-mse_bp = mean_squared_error(y_te_orig, y_pred_bp)
-time_bp = time.time() - start_bp
+# 3.4 ELM-X (orthogonal full-width + LWLR head)
+def elmx_classification(
+        X_tr, X_te, y_tr, layers,
+        alpha=1e-5, seed=42):
 
-# Print results
-print("=" * 70)
-print("COMPREHENSIVE COMPARISON RESULTS (SAADE FP METHOD)")
-print("=" * 70)
-print(f"Proposed Method (Low-Rank ALS):")
-print(f"  MSE  = {mse_proposed:.4f}")
-print(f"  Time = {time_proposed:.2f} s")
-print(f"Saade's FP Method:")
-print(f"  MSE  = {mse_fp:.4f}")
-print(f"  Time = {time_fp:.2f} s")
-print(f"ELM:")
-print(f"  MSE  = {mse_elm:.4f}")
-print(f"  Time = {time_elm:.2f} s")
-print(f"Backpropagation (BP):")
-print(f"  MSE  = {mse_bp:.4f}")
-print(f"  Time = {time_bp:.2f} s")
-print("=" * 70)
-print(f"Improvement over Saade FP: {(mse_fp - mse_proposed) / mse_fp * 100:.1f}%")
-print(f"Improvement over ELM: {(mse_elm - mse_proposed) / mse_elm * 100:.1f}%")
-print(f"Improvement over BP: {(mse_bp - mse_proposed) / mse_bp * 100:.1f}%")
-print("=" * 70)
+    rng = np.random.default_rng(seed)
+    act = lambda x: np.maximum(0, x)
+
+    H_tr = add_bias(X_tr)
+    H_te = add_bias(X_te)
+
+    C = y_tr.shape[1]
+
+    for width in layers:
+        d_in = H_tr.shape[1]
+
+        # 1. Orthogonal random features
+        Q_raw = rng.standard_normal((d_in, width))
+        Q, _ = np.linalg.qr(Q_raw)
+        Q *= np.sqrt(2.0 * width / d_in)             # He variance
+        Z_tr = H_tr @ Q                              # (n_samples, width)
+        Z_te = H_te @ Q                              # (n_samples, width)
+
+        # 2. LWLR head
+        W = ridge_solve(Z_tr, y_tr, alpha)           # (width, C)
+
+        # 3. Variance-preserving scaling
+        W *= np.sqrt(2.0 / (W**2).mean())
+
+        # forward pass
+        H_tr = add_bias(act(Z_tr @ W))
+        H_te = add_bias(act(Z_te @ W))
+
+    # final ridge head
+    W_out = ridge_solve(H_tr, y_tr, alpha=1e-3)
+    return softmax(H_te @ W_out)
+
+# -----------------------------------------------------------
+# 4. Single-run comparison
+# -----------------------------------------------------------
+def compare_methods_fmnist():
+    X_tr, X_te, y_tr, y_te, _ = load_fmnist()
+    layers = [1000, 1000, 200]
+    seed = 42
+
+    methods = {
+        "Proposed (Low-Rank ALS)": proposed_method_classification,
+        "Forward Propagation":      forward_propagation_classification,
+        "ELM":                      elm_method_classification,
+        "ELM-X":                    elmx_classification,
+    }
+
+    results = {}
+    for name, method in methods.items():
+        t0 = time.time()
+        try:
+            probs_te = method(X_tr, X_te, y_tr, layers, seed=seed)
+            acc_te = accuracy_score(np.argmax(y_te, axis=1),
+                                    np.argmax(probs_te, axis=1))
+            dt = time.time() - t0
+            results[name] = {"test": acc_te, "time": dt}
+            print(f"{name:20s}: test={acc_te:.4f}  ({dt:.1f}s)")
+        except Exception as e:
+            print(f"{name:20s}: FAILED — {e}")
+            results[name] = {"test": np.nan, "time": np.nan}
+    return results
+
+# -----------------------------------------------------------
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Fashion-MNIST single-run comparison")
+    print("=" * 60)
+    compare_methods_fmnist()
